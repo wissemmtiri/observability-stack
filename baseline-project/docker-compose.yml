@@ -1,0 +1,84 @@
+services:
+  postgres:
+    image: postgres
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+      POSTGRES_DB: app
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks: [obsnet]
+    labels:
+      logging: "enabled"
+      app: "postgres"
+      job: "db"
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    ports:
+      - "15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks: [obsnet]
+    labels:
+      logging: "enabled"
+      app: "rabbitmq"
+      job: "mq"
+
+  api:
+    build:
+      context: ./api
+    environment:
+      PORT: "8080"
+      DATABASE_URL: postgres://app:app@postgres:5432/app?sslmode=disable
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      ENVIRONMENT: dev
+      OTEL_EXPORTER_OTLP_ENDPOINT: jaeger:4318
+      OTEL_SERVICE_NAME: api
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    restart: on-failure
+    networks: [obsnet]
+    labels:
+      logging: "enabled"
+      app: "api"
+      job: "app"
+
+  worker:
+    build:
+      context: ./worker
+    environment:
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      DATABASE_URL: postgres://app:app@postgres:5432/app
+      ENVIRONMENT: dev
+      OTEL_EXPORTER_OTLP_PROTOCOL: grpc
+      OTEL_EXPORTER_OTLP_ENDPOINT: jaeger:4317
+      OTEL_SERVICE_NAME: worker
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    restart: on-failure
+    networks: [obsnet]
+    labels:
+      logging: "enabled"
+      app: "worker"
+      job: "app"
+
+networks:
+  obsnet:
+    external: true
