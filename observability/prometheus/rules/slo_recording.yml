@@ -1,61 +1,120 @@
 groups:
+# =========================
+# SLI & SLO core recordings
+# =========================
 - name: sli_slo_recording
   interval: 15s
   rules:
-  # --- Request rate per path (1m) ---
-  - record: job:http_requests_total:rate1m
-    expr: |
-      sum by (path) (
-        rate(http_requests_total{job="api"}[1m])
-      )
+    # --- Request rate per path (1m) ---
+    - record: job:http_requests_total:rate1m
+      expr: |
+        sum by (path) (
+          rate(http_requests_total{job="api"}[1m])
+        )
 
-  # --- 5xx rate per path (1m) using text statuses ---
-  - record: job:http_5xx_total:rate1m
-    expr: |
-      sum by (path) (
-        rate(http_requests_total{
-          job="api",
-          status=~"Internal Server Error|Not Implemented|Bad Gateway|Service Unavailable|Gateway Timeout|HTTP Version Not Supported|Variant Also Negotiates|Insufficient Storage|Loop Detected|Not Extended|Network Authentication Required"
-        }[1m])
-      )
-
-  # --- Availability error ratio (5m) with NUMERATOR COALESCE TO ZERO ---
-  - record: sli:api_availability:error_ratio:5m
-    expr: |
-      clamp_min(
-        (
-          sum by (path) (rate(http_requests_total{
+    # --- 5xx rate per path (1m) using text statuses ---
+    - record: job:http_5xx_total:rate1m
+      expr: |
+        sum by (path) (
+          rate(http_requests_total{
             job="api",
             status=~"Internal Server Error|Not Implemented|Bad Gateway|Service Unavailable|Gateway Timeout|HTTP Version Not Supported|Variant Also Negotiates|Insufficient Storage|Loop Detected|Not Extended|Network Authentication Required"
-          }[5m]))
-          /
-          sum by (path) (rate(http_requests_total{job="api"}[5m]))
+          }[1m])
         )
-        or on (path)
-        (0 * sum by (path) (rate(http_requests_total{job="api"}[5m])))
-      , 0)
 
-  # --- Latency SLIs ---
-  - record: sli:api_latency:p95:1m
-    expr: |
-      histogram_quantile(0.95,
-        sum by (le, path) (
-          rate(http_request_duration_seconds_bucket{job="api"}[1m])
+    # --- Availability error ratio (5m) with NUMERATOR COALESCE TO ZERO ---
+    - record: sli:api_availability:error_ratio:5m
+      expr: |
+        clamp_min(
+          (
+            sum by (path) (rate(http_requests_total{
+              job="api",
+              status=~"Internal Server Error|Not Implemented|Bad Gateway|Service Unavailable|Gateway Timeout|HTTP Version Not Supported|Variant Also Negotiates|Insufficient Storage|Loop Detected|Not Extended|Network Authentication Required"
+            }[5m]))
+            /
+            sum by (path) (rate(http_requests_total{job="api"}[5m]))
+          )
+          or on (path)
+          (0 * sum by (path) (rate(http_requests_total{job="api"}[5m])))
+        , 0)
+
+    # --- Latency SLIs ---
+    - record: sli:api_latency:p95:1m
+      expr: |
+        histogram_quantile(0.95,
+          sum by (le, path) (
+            rate(http_request_duration_seconds_bucket{job="api"}[1m])
+          )
         )
-      )
 
-  - record: sli:api_latency:p99:5m
-    expr: |
-      histogram_quantile(0.99,
-        sum by (le, path) (
-          rate(http_request_duration_seconds_bucket{job="api"}[5m])
+    - record: sli:api_latency:p99:5m
+      expr: |
+        histogram_quantile(0.99,
+          sum by (le, path) (
+            rate(http_request_duration_seconds_bucket{job="api"}[5m])
+          )
         )
-      )
 
- # --- Queue backlog (instantaneous) ---
-  - record: sli:rabbitmq_queue_depth:now
-    expr: rabbitmq_queue_messages_ready{queue="orders"}
+    # --- Queue backlog (instantaneous) ---
+    - record: sli:rabbitmq_queue_depth:now
+      expr: rabbitmq_queue_messages_ready{queue="orders"}
 
-  # --- Queue backlog (max over short window) ---
-  - record: sli:rabbitmq_queue_depth:max2m
-    expr: max_over_time(rabbitmq_queue_messages_ready{queue="orders"}[2m:5s])
+    # --- Queue backlog (max over short window) ---
+    - record: sli:rabbitmq_queue_depth:max2m
+      expr: max_over_time(rabbitmq_queue_messages_ready{queue="orders"}[2m:5s])
+
+# ======================
+# Little’s Law helpers
+# (totals; D as scalar)
+# ======================
+- name: slo_ll_recording
+  interval: 15s
+  rules:
+    # λ: Arrival rate (rps), 5m — totals for POST /v1/orders
+    - record: api:lambda_rps:5m
+      expr: |
+        sum(
+          rate(http_requests_total{job="api", method="POST", path="/v1/orders"}[5m])
+        )
+
+    # Avg job duration (s), 5m — totals
+    - record: worker:job_duration_seconds:avg:5m
+      expr: |
+        sum(rate(worker_job_duration_seconds_sum{job="worker"}[5m]))
+        /
+        clamp_min(sum(rate(worker_job_duration_seconds_count{job="worker"}[5m])), 1e-9)
+
+    # Processed-any guard (0/1), 5m — boolean then used as scalar
+    - record: worker:processed_any:5m
+      expr: |
+        sum(rate(worker_job_duration_seconds_count{job="worker"}[5m])) > bool 0
+
+    # μ: Effective capacity (rps), idle→0 (uses scalar guard)
+    - record: worker:mu_effective_rps
+      expr: |
+        (1 / clamp_min(worker:job_duration_seconds:avg:5m, 1e-3))
+        * scalar(worker:processed_any:5m)
+
+    # Backlog OK threshold = μ × D (D=5s) — unlabeled scalar
+    - record: queue:backlog_ok
+      expr: worker:mu_effective_rps * 5
+
+    # Implied wait now (s): L / μ
+    - record: queue:wait_seconds
+      expr: |
+        sli:rabbitmq_queue_depth:now
+        /
+        scalar(worker:mu_effective_rps)
+
+    # Net drain rate (rps): μ − λ (positive = draining)
+    - record: queue:drain_rps
+      expr: |
+        worker:mu_effective_rps - api:lambda_rps:5m
+
+    # Time to drain (s): L / max(drain, 0) → +Inf when not draining
+    - record: queue:time_to_drain_seconds
+      expr: |
+        sli:rabbitmq_queue_depth:now
+        /
+        on() group_left
+        clamp_min(vector(scalar(queue:drain_rps)), 0)

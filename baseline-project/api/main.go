@@ -194,6 +194,8 @@ func main() {
 			id, err = createOrder(c.Request.Context(), db, req.Item, req.Quantity)
 			if err != nil {
 				span.RecordError(err)
+				zlog.Error().Err(err).Str("event", "db_insert_error").Msg("failed to create order")
+				return err
 			}
 
 			zlog.Info().
@@ -203,9 +205,12 @@ func main() {
 				Int("quantity", req.Quantity).
 				Int64("order_id", id).
 				Msg("order_inserted")
-			return err
+			return nil
 		}(); err != nil {
-			zlog.Error().Err(err).Str("event", "db_insert_error").Msg("failed to create order")
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"error":   "failed to create order",
+				"message": "database error",
+			})
 			return
 		}
 
@@ -229,6 +234,8 @@ func main() {
 			err := pub.Publish(c.Request.Context(), msg)
 			if err != nil {
 				span.RecordError(err)
+				zlog.Error().Err(err).Str("event", "mq_publish_error").Msg("failed to publish order message")
+				return err
 			}
 			zlog.Info().
 				Str("event", "mq_publish").
@@ -236,9 +243,14 @@ func main() {
 				Str("queue", "orders").
 				Int64("order_id", id).
 				Msg("order_enqueued")
-			return err
+			return nil
 		}(); err != nil {
-			zlog.Error().Err(err).Str("event", "mq_publish_error").Msg("failed to publish order message")
+			// **Respond 503**
+			c.Header("Retry-After", "10")
+			c.JSON(http.StatusServiceUnavailable, gin.H{
+				"error":   "failed to enqueue order",
+				"message": "temporary queueing failure; please retry",
+			})
 			return
 		}
 

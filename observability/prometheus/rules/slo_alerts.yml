@@ -1,7 +1,7 @@
 groups:
 
-# 1) Queue health (RabbitMQ)
-- name: alert_queue_health
+# 1) Queue health
+- name: alert_queue_ll_health
   rules:
   # TEMP: prove we detect bursts reliably
   - alert: QueueBacklogHighTest
@@ -15,17 +15,41 @@ groups:
       summary: "TEST: orders queue backlog > 100 in last 2m"
       description: "Temporary test alert to validate detection & routing."
 
-  # Production SLO: page on sustained backlog
+  # Heads-up: arrival ≥ capacity
+  - alert: QueueOverloadHeadsUp
+    expr: api:lambda_rps:5m >bool worker:mu_effective_rps
+    for: 10m
+    labels:
+      severity: ticket
+      service: worker
+      component: capacity
+      slo: queue-overload
+    annotations:
+      summary: "Queue overload heads-up: arrival rate exceeds capacity"
+      description: "λ ≥ μ for 10 minutes. Investigate worker saturation, scale out, or reduce incoming rate."
+
+  # Backlog policy breach: L > μ×D and not draining
   - alert: QueueBacklogHigh
-    expr: sli:rabbitmq_queue_depth:now{queue="orders"} > 500
-    for: 15m
+    expr: |
+      (
+        sli:rabbitmq_queue_depth:now{queue="orders"} > scalar(queue:backlog_ok)
+      )
+      and on() (
+        api:lambda_rps:5m >= bool worker:mu_effective_rps
+      )
+      and on() (
+        api:lambda_rps:5m > bool 0
+      )
+
+    for: 15min
     labels:
       severity: ticket
       service: worker
       component: rabbitmq
+      slo: queue-backlog-policy
     annotations:
-      summary: "Orders queue backlog > 500 (sustained)"
-      description: "Scale workers or investigate consumer errors."
+      summary: "Orders backlog above policy (μ×D) and not draining"
+      description: "Backlog has exceeded the μ×D threshold while λ ≥ μ for 15 minutes. Scale workers or investigate consumer lag/errors."
 
 # 2) API latency (per-path, seconds)
 - name: alert_slo_api_latency
@@ -39,7 +63,7 @@ groups:
       slo: latency-p95-100ms
     annotations:
       summary: "p95 latency > 100ms on /v1/orders"
-      description: "Investigate worker saturation, DB, or queue; see traces/logs."
+      description: "Investigate worker saturation, DB, or queue; see traces and logs."
 
   - alert: APIHighLatencyP99
     expr: sli:api_latency:p99:5m{path="/v1/orders"} > 0.2
@@ -50,10 +74,9 @@ groups:
       slo: latency-p99-200ms
     annotations:
       summary: "p99 latency > 200ms on /v1/orders"
-      description: "Tail latency elevated; check slow paths and downstreams."
+      description: "Tail latency elevated; check slow paths and downstream dependencies."
 
 # 3) API availability — burn-rate for 99.9% over 30d
-# We use multi-window multi-burn thresholds.
 - name: alert_slo_api_availability
   rules:
   # Fast burn: would exhaust budget quickly if sustained
@@ -69,9 +92,9 @@ groups:
       slo: availability-99.9-30d
     annotations:
       summary: "High error burn (short) on /v1/orders"
-      description: "5m & 1h burn-rate > 14.4× budget (SLO 99.9%)."
+      description: "5m and 1h burn rates exceed 14.4× the error budget for a 99.9% SLO."
 
-  # Sustained burn: still serious but slower
+  # Sustained burn: slower but still budget-threatening
   - alert: APIHighErrorBurnRateLong
     expr: |
       (avg_over_time(sli:api_availability:error_ratio:5m{path="/v1/orders"}[1h]) / 0.001) > 6
@@ -84,4 +107,4 @@ groups:
       slo: availability-99.9-30d
     annotations:
       summary: "High error burn (long) on /v1/orders"
-      description: "1h & 6h burn-rate > 6× budget (SLO 99.9%)."
+      description: "1h and 6h burn rates exceed 6× the error budget for a 99.9% SLO."
